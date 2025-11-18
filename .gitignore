@@ -1,0 +1,4 @@
+maildata/
+mailstate/
+.env
+config/
