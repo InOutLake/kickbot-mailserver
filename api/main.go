@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/emersion/go-imap"
 	imapclient "github.com/emersion/go-imap/client"
+	"github.com/emersion/go-message/mail"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -227,10 +229,51 @@ func listenForEmails(bot *tgbotapi.BotAPI, chatID int64, username, password stri
 					from := msg.Envelope.From[0].Address()
 
 					r := msg.GetBody(section)
-					if r != nil {
-						text := fmt.Sprintf("📧 **New Email for %s**\nFrom: %s\nSubject: %s", username, from, subject)
-						reply(bot, chatID, text)
+					if r == nil {
+						continue
 					}
+
+					mr, err := mail.CreateReader(r)
+					if err != nil {
+						log.Printf("Failed to create mail reader: %v", err)
+						continue
+					}
+
+					var bodyText string
+
+					for {
+						p, err := mr.NextPart()
+						if err == io.EOF {
+							break
+						} else if err != nil {
+							log.Printf("Error reading email part: %v", err)
+							break
+						}
+
+						switch h := p.Header.(type) {
+						case *mail.InlineHeader:
+							contentType, _, _ := h.ContentType()
+
+							if contentType == "text/plain" || (contentType == "text/html" && bodyText == "") {
+								b, _ := io.ReadAll(p.Body)
+								bodyText = string(b)
+							}
+						}
+					}
+
+					if bodyText == "" {
+						bodyText = "[Email contains no text body]"
+					}
+
+					if len(bodyText) > 3000 {
+						bodyText = bodyText[:3000] + "... [truncated]"
+					}
+
+					text := fmt.Sprintf("📧 **From:** %s\n**Subject:** %s\n\n%s", from, subject, bodyText)
+
+					msgConf := tgbotapi.NewMessage(chatID, text)
+					// msgConf.ParseMode = "Markdown" // NOTE: markdown seems to be broken because of mime spec symbols
+					bot.Send(msgConf)
 				}
 
 				if err := <-done; err != nil {

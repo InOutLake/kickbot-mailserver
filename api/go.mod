@@ -5,6 +5,7 @@ go 1.25.4
 require (
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/emersion/go-imap v1.2.1
+	github.com/emersion/go-message v0.18.2
 	github.com/go-telegram-bot-api/telegram-bot-api/v5 v5.5.1
 )
 
