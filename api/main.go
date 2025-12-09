@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"os"
@@ -57,6 +58,7 @@ func main() {
 	defer dockerCli.Close()
 
 	/* telegram bot */
+	log.Printf("Attempting bot authorization...\n")
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		log.Fatalf("Failed to create Telegram bot: %v", err)
@@ -169,7 +171,9 @@ func listenForEmails(bot *tgbotapi.BotAPI, chatID int64, username, password stri
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
-	c, err := imapclient.DialTLS(imapServer, nil)
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+
+	c, err := imapclient.DialTLS(imapServer, tlsConfig)
 	if err != nil {
 		var err2 error
 		c, err2 = imapclient.Dial(imapServer)
