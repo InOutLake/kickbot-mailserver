@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,10 +30,44 @@ var (
 	defaultPassword = os.Getenv("DEFAULT_PASSWORD")
 	apiKey          = os.Getenv("API_KEY")
 	imapServer      = os.Getenv("IMAP_SERVER")
+	localedir       = os.Getenv("LOCALE_DIR")
 )
 
-func validateEnv() {
-	required := []string{"TELEGRAM_BOT_TOKEN", "MAIL_DOMAIN", "MAILSERVER_CONTAINER", "DEFAULT_PASSWORD", "API_KEY", "IMAP_SERVER"}
+const (
+	MsgGreeting             = "greeting"
+	MsgAuthUsage            = "auth_usage"
+	MsgAuthSuccess          = "auth_success"
+	MsgAuthFail             = "auth_invalid"
+	MsgUnauthorized         = "unauthorized"
+	MsgUnknownCommand       = "unknown_command"
+	MsgChangeLocaleUsage    = "change_locale_usage"
+	MsgChangeLocaleSuccess  = "change_locale_success"
+	MsgChangeLocaleFail     = "change_locale_fail"
+	MsgCreateUsage          = "create_usage"
+	MsgCreateSuccess        = "create_success"
+	MsgCreateFailed         = "create_failed"
+	MsgListenUsage          = "listen_usage"
+	MsgListenStart          = "listen_start"
+	MsgListenStopped        = "listen_stopped"
+	MsgEmailFromat          = "email_message"
+	MsgClearUsage           = "clear_usage"
+	MsgClearSuccess         = "clear_success"
+	MsgImapConnectionFailed = "imap_connection_failed"
+	MsgImapLoginFailed      = "imap_login_failed"
+	MsgReadInboxFailed      = "read_inbox_failed"
+	MsgFetchFailed          = "fetch_failed"
+	MsgTruncated            = "truncated"
+	MsgNoTextBody           = "no_text_body"
+	MsgEmailFormat          = "email_format"
+	MsgCheckProgress        = "check_progress"
+	MsgFoundNothing         = "found_nothing"
+)
+
+/* NOTE: don't want to bother passing it here and there, so use global variable */
+var tStore = InitTranslationStore(localedir)
+
+func ValidateEnv() {
+	required := []string{"TELEGRAM_BOT_TOKEN", "MAIL_DOMAIN", "MAILSERVER_CONTAINER", "DEFAULT_PASSWORD", "API_KEY", "IMAP_SERVER", "LOCALE_DIR"}
 	for _, env := range required {
 		if os.Getenv(env) == "" {
 			log.Fatalf("Missing required environment variable: %s", env)
@@ -37,41 +75,167 @@ func validateEnv() {
 	}
 }
 
+func InitTranslationStore(dir string) *TranslationStore {
+	store := &TranslationStore{
+		translations: make(map[string]map[string]string),
+	}
+	store.loadTranslations(dir)
+	return store
+}
+
+type UserSession struct {
+	ChatID          int64
+	Authorized      bool
+	ListeningTo     []string
+	ListeningCancel func()
+	Language        string
+}
+
+func (user *UserSession) Authorize() {
+	user.Authorized = true
+}
+
+func (user *UserSession) ListenTo(username string) {
+	if slices.Contains(user.ListeningTo, username) {
+		return
+	}
+	user.ListeningTo = append(user.ListeningTo, username)
+}
+
 type SessionManager struct {
-	authorizedUsers sync.Map
+	sessions sync.Map
+}
+
+type TranslationStore struct {
+	translations map[string]map[string]string
+	mu           sync.RWMutex
+}
+
+func (ts *TranslationStore) loadTranslations(dir string) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatalf("Failed to read translation directory %s: %v", dir, err)
+	}
+
+	for _, file := range files {
+		if !file.IsDir() && filepath.Ext(file.Name()) == ".json" {
+			langCode := strings.TrimSuffix(file.Name(), ".json")
+			filePath := filepath.Join(dir, file.Name())
+
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				log.Printf("Warning: Failed to read %s: %v", filePath, err)
+				continue
+			}
+
+			var messages map[string]string
+			if err := json.Unmarshal(data, &messages); err != nil {
+				log.Printf("Warning: Failed to parse JSON in %s: %v", filePath, err)
+				continue
+			}
+
+			ts.translations[langCode] = messages
+			log.Printf("Loaded translations for language: %s", langCode)
+		}
+	}
+
+	if _, ok := ts.translations["en"]; !ok {
+		log.Fatal("Error: Default 'en' translation file (en.json) is missing.")
+	}
+}
+
+func (ts *TranslationStore) GetMessage(langCode, key string, args ...any) string {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	if msgs, ok := ts.translations[langCode]; ok {
+		if msg, ok := msgs[key]; ok {
+			return fmt.Sprintf(msg, args...)
+		}
+	}
+
+	if msgs, ok := ts.translations["en"]; ok {
+		if msg, ok := msgs[key]; ok {
+			if langCode != "en" {
+				log.Printf("Warning: Missing translation key '%s' in language '%s'. Falling back to 'en'.", key, langCode)
+			}
+			return fmt.Sprintf(msg, args...)
+		}
+	}
+
+	log.Printf("Error: Translation key '%s' missing in all loaded languages.", key)
+	return fmt.Sprintf("Oh no! Translation missing: %s", key)
+}
+
+func (ts *TranslationStore) GetT(session *UserSession, key string, args ...any) string {
+	langCode := session.Language
+	return ts.GetMessage(langCode, key, args)
+}
+
+func InitSessionManager() *SessionManager {
+	return &SessionManager{}
+}
+
+func (sm *SessionManager) GetSession(chatID int64) *UserSession {
+	if session, ok := sm.sessions.Load(chatID); ok {
+		return session.(*UserSession)
+	} else {
+		newSession := &UserSession{
+			ChatID:      chatID,
+			Authorized:  false,
+			ListeningTo: []string{},
+			Language:    "en",
+		}
+		sm.sessions.Store(chatID, newSession)
+		return newSession
+	}
 }
 
 func (sm *SessionManager) IsAuthorized(chatID int64) bool {
-	val, ok := sm.authorizedUsers.Load(chatID)
-	return ok && val.(bool)
+	session := sm.GetSession(chatID)
+	return session.Authorized
 }
 
-func (sm *SessionManager) Authorize(chatID int64) {
-	sm.authorizedUsers.Store(chatID, true)
+func SetupLogging() {
+	log.SetFlags(log.Ldate | log.Ltime)
 }
 
-func main() {
-	validateEnv()
-
-	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Fatalf("Failed to create Docker client: %v", err)
-	}
-	defer dockerCli.Close()
-
-	/* telegram bot */
-	log.Printf("Attempting bot authorization...\n")
+func InitTelegramBot() (*tgbotapi.BotAPI, tgbotapi.UpdatesChannel) {
+	log.Printf("Attempting bot authorization...")
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
-		log.Fatalf("Failed to create Telegram bot: %v", err)
+		log.Fatalf("Failed to create Telegram bot: %v\n", err)
 	}
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-
+	log.Printf("Authorized on account %s\n", bot.Self.UserName)
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
+	return bot, updates
+}
 
-	sessionMgr := &SessionManager{}
+func InitDockerCli() (*client.Client, func()) {
+	log.Printf("Connecting to docker... ")
+	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatalf("Failed to create Docker client: %v\n", err)
+	}
+	cleanup := func() {
+		log.Println("Closing Docker client connection.")
+		if err := dockerCli.Close(); err != nil {
+			log.Printf("Error closing docker connection")
+		}
+	}
+	return dockerCli, cleanup
+}
+
+func main() {
+	/* inits */
+	ValidateEnv()
+	SetupLogging()
+	sessionManager := InitSessionManager()
+	bot, updates := InitTelegramBot()
+	dockerCli, dockerCleanup := InitDockerCli()
+	defer dockerCleanup()
 
 	/* main bot loop */
 	for update := range updates {
@@ -80,209 +244,292 @@ func main() {
 		}
 
 		chatID := update.Message.Chat.ID
+		user := sessionManager.GetSession(chatID)
 		msgText := update.Message.Text
 		args := strings.Fields(msgText)
 		command := args[0]
 
-		// Handle /auth command specifically (does not require auth to run)
 		if command == "/auth" {
-			handleAuth(bot, sessionMgr, update.Message, args)
+			handleAuth(bot, user, args)
 			continue
 		}
 
-		// Middleware: Check Authorization for all other commands
-		if !sessionMgr.IsAuthorized(chatID) {
-			reply(bot, chatID, "⛔ Unauthorized. Please authenticate using `/auth <YOUR_API_KEY>`")
+		if command == "/start" {
+			handleGreeting(bot, user)
+		}
+
+		if !sessionManager.IsAuthorized(chatID) {
+			replyByKey(bot, user, MsgUnauthorized, true)
 			continue
 		}
 
-		// Command Switch
 		switch command {
-		case "/start":
-			reply(bot, chatID, "Welcome! \nCommands:\n/create <username> - Create new email\n/listen <username> <minutes> - Forward incoming emails")
 		case "/create":
-			handleCreate(bot, dockerCli, update.Message, args)
+			handleCreate(bot, dockerCli, user, args)
 		case "/listen":
-			handleListen(bot, update.Message, args)
+			handleListen(bot, user, args)
+		case "/check":
+			handleCheck(bot, user, true)
+		case "/clear":
+			handleClear(bot, user, args)
+		case "/language":
+			handleChangeLanguage(bot, user, args)
 		default:
-			reply(bot, chatID, "Unknown command.")
+			replyByKey(bot, user, MsgUnknownCommand, true)
 		}
 	}
 }
 
 /* --- Bot functions --- */
-func reply(bot *tgbotapi.BotAPI, chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "Markdown"
-	bot.Send(msg)
+func reply(bot *tgbotapi.BotAPI, user *UserSession, text string, md bool) {
+	msg := tgbotapi.NewMessage(user.ChatID, text)
+	if md {
+		msg.ParseMode = "Markdown"
+	}
+	if _, err := bot.Send(msg); err != nil {
+		log.Printf("Error sending message: %v", err)
+	}
 }
 
-func handleAuth(bot *tgbotapi.BotAPI, sm *SessionManager, msg *tgbotapi.Message, args []string) {
+func replyByKey(bot *tgbotapi.BotAPI, user *UserSession, key string, md bool) {
+	msg := tStore.GetT(user, key)
+	reply(bot, user, msg, md)
+}
+
+func handleGreeting(bot *tgbotapi.BotAPI, user *UserSession) {
+	replyByKey(bot, user, MsgGreeting, true)
+}
+
+func handleChangeLanguage(bot *tgbotapi.BotAPI, user *UserSession, args []string) {
+	if len(args) == 2 {
+		for locale := range tStore.translations {
+			if locale == args[1] {
+				user.Language = args[1]
+				replyByKey(bot, user, MsgChangeLocaleSuccess, true)
+				return
+			}
+		}
+		replyByKey(bot, user, MsgChangeLocaleFail, true)
+	}
+	msg := tStore.GetT(user, MsgChangeLocaleUsage)
+	reply(bot, user, msg, true)
+}
+
+func handleAuth(bot *tgbotapi.BotAPI, user *UserSession, args []string) {
 	if len(args) < 2 {
-		reply(bot, msg.Chat.ID, "Usage: /auth <API_KEY>")
+		replyByKey(bot, user, MsgAuthUsage, true)
 		return
 	}
 	if args[1] == apiKey {
-		sm.Authorize(msg.Chat.ID)
-		reply(bot, msg.Chat.ID, "✅ Authenticated successfully! You can now use bot commands.")
+		user.Authorize()
+		replyByKey(bot, user, MsgAuthSuccess, true)
 	} else {
-		reply(bot, msg.Chat.ID, "❌ Invalid API Key.")
+		replyByKey(bot, user, MsgAuthFail, true)
 	}
 }
 
-func handleCreate(bot *tgbotapi.BotAPI, dockerCli *client.Client, msg *tgbotapi.Message, args []string) {
+func handleCreate(bot *tgbotapi.BotAPI, dockerCli *client.Client, user *UserSession, args []string) {
 	if len(args) < 2 {
-		reply(bot, msg.Chat.ID, "Usage: /create <username>")
+		replyByKey(bot, user, MsgCreateUsage, true)
 		return
 	}
+
 	username := args[1]
-
-	reply(bot, msg.Chat.ID, fmt.Sprintf("⏳ Creating account %s@%s...", username, domain))
-
 	err := createEmailContainerExec(context.Background(), dockerCli, username)
 	if err != nil {
-		reply(bot, msg.Chat.ID, fmt.Sprintf("❌ Failed: %v", err))
+		replyByKey(bot, user, MsgCreateFailed, true)
 		return
 	}
-
-	reply(bot, msg.Chat.ID, fmt.Sprintf("✅ Account created: %s@%s\nPassword: %s", username, domain, defaultPassword))
+	user.ListenTo(username)
+	replyByKey(bot, user, MsgCreateSuccess, true)
 }
 
-func handleListen(bot *tgbotapi.BotAPI, msg *tgbotapi.Message, args []string) {
-	if len(args) < 3 {
-		reply(bot, msg.Chat.ID, "Usage: /listen <username> <minutes>")
-		return
+func handleListen(bot *tgbotapi.BotAPI, user *UserSession, args []string) {
+	if len(args) > 2 {
+		replyByKey(bot, user, MsgListenUsage, true)
 	}
-	username := args[1]
-	duration, err := time.ParseDuration(args[2] + "m")
-	if err != nil {
-		reply(bot, msg.Chat.ID, "Invalid duration. Use integer for minutes (e.g., '10').")
-		return
+	if len(args) == 2 {
+		username := args[1]
+		user.ListenTo(username)
 	}
 
-	email := fmt.Sprintf("%s@%s", username, domain)
-	reply(bot, msg.Chat.ID, fmt.Sprintf("📡 Listening for new emails on %s for %v...", email, duration))
+	message := tStore.GetT(user, MsgListenStart)
+	message = fmt.Sprintf(message+"\n - %s", strings.Join(user.ListeningTo, "\n - "))
+	reply(bot, user, message, true)
 
-	go listenForEmails(bot, msg.Chat.ID, username, defaultPassword, duration)
+	go listenForEmails(bot, user)
 }
 
-/* --- Core Logic --- */
+func handleClear(bot *tgbotapi.BotAPI, user *UserSession, args []string) {
+	if len(args) != 1 {
+		replyByKey(bot, user, MsgClearUsage, true)
+		return
+	}
+	user.ListeningTo = []string{}
+	replyByKey(bot, user, MsgClearSuccess, true)
+}
 
-func listenForEmails(bot *tgbotapi.BotAPI, chatID int64, username, password string, duration time.Duration) {
-	fullEmail := fmt.Sprintf("%s@%s", username, domain)
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
+/* --- core Logic --- */
+func listenForEmails(bot *tgbotapi.BotAPI, user *UserSession) {
+	timeout, _ := time.ParseDuration("20m")
+	if user.ListeningCancel != nil {
+		user.ListeningCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	user.ListeningCancel = cancel
 	defer cancel()
 
-	tlsConfig := &tls.Config{InsecureSkipVerify: true}
-
-	c, err := imapclient.DialTLS(imapServer, tlsConfig)
-	if err != nil {
-		var err2 error
-		c, err2 = imapclient.Dial(imapServer)
-		if err2 != nil {
-			reply(bot, chatID, fmt.Sprintf("❌ IMAP Connection failed for %s: %v", fullEmail, err))
-			return
-		}
-	}
-	defer c.Logout()
-
-	if err := c.Login(fullEmail, password); err != nil {
-		reply(bot, chatID, fmt.Sprintf("❌ IMAP Login failed for %s: %v", fullEmail, err))
-		return
-	}
-
-	mbox, err := c.Select("INBOX", false)
-	if err != nil {
-		return
-	}
-
-	lastSeenSeqNum := mbox.Messages
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			reply(bot, chatID, fmt.Sprintf("🛑 Stopped listening on %s (Time expired)", fullEmail))
 			return
 		case <-ticker.C:
-			mbox, err = c.Select("INBOX", false)
-			if err != nil {
-				continue
-			}
+			handleCheck(bot, user, false)
+		}
+	}
+}
 
-			if mbox.Messages > lastSeenSeqNum {
-				seqSet := new(imap.SeqSet)
-				seqSet.AddRange(lastSeenSeqNum+1, mbox.Messages)
+func establishConnecion(bot *tgbotapi.BotAPI, user *UserSession, username string) (*imapclient.Client, error) {
+	tlsConfig := &tls.Config{InsecureSkipVerify: true}
+	c, err := imapclient.DialTLS(imapServer, tlsConfig)
+	if err != nil {
+		var err2 error
+		c, err2 = imapclient.Dial(imapServer)
+		if err2 != nil {
+			log.Printf("Connetction failed for: %v\t cause %v", user, err)
+			replyByKey(bot, user, MsgImapConnectionFailed, true)
+			return nil, err
+		}
+	}
+	fullEmail := fmt.Sprintf("%s@%s", username, domain)
+	if err := c.Login(fullEmail, defaultPassword); err != nil {
+		log.Printf("Connetction failed for: %v\t as %s\t cause %v", user, fullEmail, err)
+		return nil, err
+	}
+	return c, nil
+}
 
-				section := &imap.BodySectionName{}
-				items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
-				messages := make(chan *imap.Message, 10)
+func checkNewEmails(c *imapclient.Client) ([]uint32, error) {
+	_, err := c.Select("INBOX", false)
+	if err != nil {
+		return nil, err
+	}
+	criteria := imap.NewSearchCriteria()
+	criteria.WithoutFlags = []string{imap.SeenFlag}
+	uids, err := c.Search(criteria)
+	if err != nil {
+		return nil, err
+	}
+	return uids, nil
+}
 
-				done := make(chan error, 1)
-				go func() {
-					done <- c.Fetch(seqSet, items, messages)
-				}()
+func fetchMessages(c *imapclient.Client, uids []uint32) (chan *imap.Message, *imap.BodySectionName, error) {
+	seqSet := new(imap.SeqSet)
+	seqSet.AddNum(uids...)
 
-				for msg := range messages {
-					subject := msg.Envelope.Subject
-					from := msg.Envelope.From[0].Address()
+	section := &imap.BodySectionName{}
+	items := []imap.FetchItem{section.FetchItem(), imap.FetchEnvelope}
+	messages := make(chan *imap.Message, len(uids)+10)
+	if err := c.Fetch(seqSet, items, messages); err != nil {
+		return nil, nil, err
+	}
+	return messages, section, nil
+}
 
-					r := msg.GetBody(section)
-					if r == nil {
-						continue
-					}
+func composeMessage(user *UserSession, username string, msg *imap.Message, section *imap.BodySectionName) (string, error) {
+	subject := msg.Envelope.Subject
+	from := msg.Envelope.From[0].Address()
 
-					mr, err := mail.CreateReader(r)
-					if err != nil {
-						log.Printf("Failed to create mail reader: %v", err)
-						continue
-					}
+	r := msg.GetBody(section)
+	if r == nil {
+		return "", errors.New("NoBody")
+	}
 
-					var bodyText string
+	mr, err := mail.CreateReader(r)
+	if err != nil {
+		log.Printf("Failed to create mail reader: %v", err)
+		return "", err
+	}
 
-					for {
-						p, err := mr.NextPart()
-						if err == io.EOF {
-							break
-						} else if err != nil {
-							log.Printf("Error reading email part: %v", err)
-							break
-						}
+	var bodyText string
 
-						switch h := p.Header.(type) {
-						case *mail.InlineHeader:
-							contentType, _, _ := h.ContentType()
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Printf("Error reading email part: %v", err)
+			break
+		}
 
-							if contentType == "text/plain" || (contentType == "text/html" && bodyText == "") {
-								b, _ := io.ReadAll(p.Body)
-								bodyText = string(b)
-							}
-						}
-					}
+		switch h := p.Header.(type) {
+		case *mail.InlineHeader:
+			contentType, _, _ := h.ContentType()
 
-					if bodyText == "" {
-						bodyText = "[Email contains no text body]"
-					}
-
-					if len(bodyText) > 3000 {
-						bodyText = bodyText[:3000] + "... [truncated]"
-					}
-
-					text := fmt.Sprintf("📧 **From:** %s\n**Subject:** %s\n\n%s", from, subject, bodyText)
-
-					msgConf := tgbotapi.NewMessage(chatID, text)
-					// msgConf.ParseMode = "Markdown" // NOTE: markdown seems to be broken because of mime spec symbols
-					bot.Send(msgConf)
-				}
-
-				if err := <-done; err != nil {
-					log.Println("Fetch error:", err)
-				}
-
-				lastSeenSeqNum = mbox.Messages
+			if contentType == "text/plain" || (contentType == "text/html" && bodyText == "") {
+				b, _ := io.ReadAll(p.Body)
+				bodyText = string(b)
 			}
 		}
+	}
+
+	if bodyText == "" {
+		bodyText = tStore.GetT(user, MsgNoTextBody)
+	}
+
+	if len(bodyText) > 3000 {
+		bodyText = bodyText[:3000] + tStore.GetT(user, MsgTruncated)
+	}
+
+	text := tStore.GetT(user, MsgEmailFormat)
+	text = fmt.Sprintf(text, username, from, subject, bodyText)
+	return text, nil
+}
+
+func handleCheck(bot *tgbotapi.BotAPI, user *UserSession, verbose bool) {
+	found := false
+	if verbose {
+		replyByKey(bot, user, MsgCheckProgress, true)
+	}
+	for _, username := range user.ListeningTo {
+		func(targetUser string) {
+			c, err := establishConnecion(bot, user, targetUser)
+			if err != nil {
+				replyByKey(bot, user, MsgImapLoginFailed, true)
+				return
+			}
+			defer c.Logout()
+
+			uids, err := checkNewEmails(c)
+			if err != nil {
+				replyByKey(bot, user, MsgReadInboxFailed, true)
+				return
+			}
+
+			if len(uids) > 0 {
+				messages, section, err := fetchMessages(c, uids)
+				if err != nil {
+					replyByKey(bot, user, MsgFetchFailed, true)
+					return
+				}
+
+				for msg := range messages {
+					text, err := composeMessage(user, username, msg, section)
+					if err != nil {
+						log.Printf("Failed to compose message: %v", err)
+						continue
+					}
+					reply(bot, user, text, false)
+					found = true
+				}
+			}
+		}(username)
+	}
+	if verbose && !found {
+		replyByKey(bot, user, MsgFoundNothing, true)
 	}
 }
 

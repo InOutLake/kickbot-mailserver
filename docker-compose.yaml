@@ -33,13 +33,28 @@ services:
     restart: unless-stopped
 
 
+    # NOTE: use this setup in case you don't want to push any images and work locally
+    #
+  # api:
+  #   build:
+  #     context: ./api
+  #     dockerfile: Dockerfile
+  #
+  #   container_name: mail-api
+  #
+  #   env_file:
+  #     - .env
+  #
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #
+  #   ports:
+  #     - "8080:8080"
+  #
+  #   restart: unless-stopped
   api:
-    build:
-      context: ./api
-      dockerfile: Dockerfile
-
+    image: inoutlake/mailserver_api:latest
     container_name: mail-api
-
     env_file:
       - .env
 
@@ -50,6 +65,8 @@ services:
       - "8080:8080"
 
     restart: unless-stopped
+
+  
 
 
 networks:
